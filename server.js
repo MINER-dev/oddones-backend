@@ -1,68 +1,121 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch"; // Needed for sending data to Google Sheets webhook
+import fs from "fs";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+// 🔹 Environment Variables in Render
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
 
-// --------------------
-// In-memory whitelist claims
-// --------------------
-let wlClaimed = [];
+// 🔹 Load whitelist codes from file
+const whitelist = new Set(
+  fs.readFileSync("whitelist_codes.txt", "utf8").split("\n").map(c => c.trim()).filter(Boolean)
+);
 
-// --------------------
-// Root endpoint (for testing Render)
-// --------------------
-app.get("/", (req, res) => {
-  res.send("Oddones backend is running!");
+// 🔹 Track claimed codes
+let claimedCodes = new Set();
+
+// 🔹 Basic rate limiting to prevent abuse
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 15;
+
+app.use((req, res, next) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const now = Date.now();
+
+  if (!requestCounts.has(ip)) {
+    requestCounts.set(ip, []);
+  }
+
+  const timestamps = requestCounts.get(ip).filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
+  timestamps.push(now);
+  requestCounts.set(ip, timestamps);
+
+  if (timestamps.length > MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({ success: false, message: "Too many requests. Please slow down!" });
+  }
+
+  next();
 });
 
-// --------------------
-// Whitelist claim endpoint
-// --------------------
+// 🟢 AI Chat Proxy
+app.post("/chat", async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ success: false, message: "No message provided" });
+
+  try {
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://yourdomain.com"
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct:free",
+        messages: [
+          {
+            role: "system",
+            content: `You are the Oddones assistant. Only answer about Oddones and whitelist codes.
+                      If asked off-topic, reply sarcastically and redirect to Oddones. Keep responses short and witty.`
+          },
+          { role: "user", content: message }
+        ]
+      })
+    });
+
+    const data = await resp.json();
+    const reply = data.choices?.[0]?.message?.content || "No response";
+
+    res.json({ success: true, reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "AI request failed" });
+  }
+});
+
+// 🟢 Whitelist Claim Endpoint
 app.post("/claim", async (req, res) => {
   const { code, wallet } = req.body;
-
   if (!code || !wallet) {
-    return res.status(400).json({ success: false, message: "Missing code or wallet" });
+    return res.status(400).json({ success: false, message: "Code and wallet are required" });
   }
 
   const upperCode = code.toUpperCase();
 
-  // Check for duplicates
-  const exists = wlClaimed.find(entry => entry.code === upperCode);
-  if (exists) {
-    console.log(`Duplicate attempt detected for code ${upperCode}`);
-    return res.json({ success: false, message: "Code already claimed" });
+  // Validate whitelist code
+  if (!whitelist.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "Invalid code." });
   }
 
-  // Save claim in memory
-  wlClaimed.push({ code: upperCode, wallet });
-  console.log("New claim:", wlClaimed);
+  // Check if already claimed
+  if (claimedCodes.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
 
-  // --------------------
-  // Forward to Google Sheets
-  // --------------------
+  // Mark as claimed
+  claimedCodes.add(upperCode);
+
+  // Forward to Google Sheets webhook
   try {
-    await fetch("https://script.google.com/macros/s/AKfycbzpLi0hAVJQOoDS9XqXcbKCfmsWCrD0rRQCdTkJmb25ZuZdzEuobHuxJJVrwxDob0c/exec", {
+    await fetch(GOOGLE_SHEETS_WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code: upperCode, wallet })
     });
-    console.log(`Forwarded to Google Sheets: ${upperCode} -> ${wallet}`);
   } catch (err) {
-    console.error("Google Sheets Error:", err);
+    console.error("Failed to send to Google Sheets:", err.message);
   }
 
+  console.log("New claim:", { code: upperCode, wallet });
   res.json({ success: true, message: "Whitelist claim successful" });
 });
 
-// --------------------
-// Start server
-// --------------------
-app.listen(PORT, () => {
-  console.log(`✅ Oddones backend running on port ${PORT}`);
-});
+// Render Port Handling
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes`));
