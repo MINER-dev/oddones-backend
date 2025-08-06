@@ -7,19 +7,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔹 Environment Variables in Render
+// 🔹 Environment Variables (set in Render)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
 
 // 🔹 Load whitelist codes from file
 const whitelist = new Set(
-  fs.readFileSync("whitelist_codes.txt", "utf8").split("\n").map(c => c.trim()).filter(Boolean)
+  fs.readFileSync("whitelist_codes.txt", "utf8")
+    .split("\n")
+    .map(c => c.trim())
+    .filter(Boolean)
 );
 
 // 🔹 Track claimed codes
 let claimedCodes = new Set();
 
-// 🔹 Basic rate limiting to prevent abuse
+// 🔹 Rate Limiting to prevent abuse
 const requestCounts = new Map();
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 15;
@@ -79,26 +82,42 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// 🟢 Whitelist Claim Endpoint
-app.post("/claim", async (req, res) => {
-  const { code, wallet } = req.body;
-  if (!code || !wallet) {
-    return res.status(400).json({ success: false, message: "Code and wallet are required" });
-  }
+// 🟢 Step 1: Validate Code
+app.post("/validate", (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ success: false, message: "Code is required" });
 
   const upperCode = code.toUpperCase();
 
-  // Validate whitelist code
   if (!whitelist.has(upperCode)) {
     return res.status(400).json({ success: false, message: "Invalid code." });
   }
 
-  // Check if already claimed
   if (claimedCodes.has(upperCode)) {
     return res.status(400).json({ success: false, message: "This code has already been claimed." });
   }
 
-  // Mark as claimed
+  res.json({ success: true, message: "Code is valid. Please submit your wallet to claim." });
+});
+
+// 🟢 Step 2: Claim Code with Wallet
+app.post("/claim", async (req, res) => {
+  const { code, wallet } = req.body;
+  if (!code || !wallet || wallet === "pending") {
+    return res.status(400).json({ success: false, message: "Valid code and wallet are required" });
+  }
+
+  const upperCode = code.toUpperCase();
+
+  if (!whitelist.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "Invalid code." });
+  }
+
+  if (claimedCodes.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
+
+  // ✅ Claim now
   claimedCodes.add(upperCode);
 
   // Forward to Google Sheets webhook
