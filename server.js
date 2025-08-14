@@ -1,110 +1,125 @@
-const BACKEND_URL = "https://oddones-backend.onrender.com"; // replace with your actual Render URL
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import fetch from "node-fetch";
 
-const messagesContainer = document.getElementById("messages");
-const chatForm = document.getElementById("chat-form");
-const input = document.getElementById("message-input");
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-let awaitingWallet = false;
-let lastValidCode = null;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK; // Google Apps Script URL
 
-// Welcome message
-appendMessage("ai", "👾 Welcome to Oddones Portal! Do you have a secret code for me to decipher? Enter code or ask me anything about Oddones");
+// Store claimed codes in memory (runtime only)
+let claimedCodes = new Set();
 
-function appendMessage(sender, text) {
-  const div = document.createElement("div");
-  div.className = `msg ${sender}`;
-  div.textContent = text;
-  messagesContainer.appendChild(div);
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
-}
+// Rate limiting
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 15;
 
-chatForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const userMessage = input.value.trim();
-  if (!userMessage) return;
-
-  appendMessage("user", userMessage);
-  input.value = "";
-
-  if (awaitingWallet) {
-    handleWalletSubmission(userMessage);
-    return;
+app.use((req, res, next) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const now = Date.now();
+  if (!requestCounts.has(ip)) requestCounts.set(ip, []);
+  const timestamps = requestCounts.get(ip).filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
+  timestamps.push(now);
+  requestCounts.set(ip, timestamps);
+  if (timestamps.length > MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({ success: false, message: "Too many requests. Please slow down!" });
   }
-
-  // Always send to backend for validation
-  if (userMessage.toUpperCase().startsWith("ODD-")) {
-    handleWhitelistCode(userMessage.toUpperCase());
-    return;
-  }
-
-  await sendToAI(userMessage);
+  next();
 });
 
-// Step 1: Validate Code
-async function handleWhitelistCode(code) {
-  appendMessage("ai", "🔍 Deciphering your code...");
+// Chat endpoint
+app.post("/chat", async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ success: false, message: "No message provided" });
 
   try {
-    const res = await fetch(`${BACKEND_URL}/validate`, {
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code })
-    });
-
-    const data = await res.json();
-
-    if (data.success) {
-      appendMessage("ai", "🎉 Code accepted! Drop your wallet address and I’ll plug you in.");
-      awaitingWallet = true;
-      lastValidCode = code;
-    } else {
-      appendMessage("ai", `❌ ${data.message}`);
-    }
-  } catch (err) {
-    console.error(err);
-    appendMessage("ai", "❌ Error verifying your code. Try again later.");
-  }
-}
-
-// Step 2: Submit Wallet to Claim
-async function handleWalletSubmission(wallet) {
-  appendMessage("ai", "💾 Processing your wallet...");
-
-  try {
-    const res = await fetch(`${BACKEND_URL}/claim`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: lastValidCode, wallet })
-    });
-
-    const data = await res.json();
-
-    if (data.success) {
-      appendMessage("ai", "✅ Whitelist locked. You're officially one of the OddOnes!");
-      awaitingWallet = false;
-      lastValidCode = null;
-    } else {
-      appendMessage("ai", `❌ ${data.message}`);
-    }
-  } catch (err) {
-    console.error(err);
-    appendMessage("ai", "❌ Error saving wallet. Try again later.");
-  }
-}
-
-// AI Chat
-async function sendToAI(userMessage) {
-  try {
-    const resp = await fetch(`${BACKEND_URL}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMessage })
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://yourdomain.com"
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct:free",
+        messages: [
+          { role: "system", content: `You are the Oddones assistant. Only answer about Oddones and whitelist codes.` },
+          { role: "user", content: message }
+        ]
+      })
     });
 
     const data = await resp.json();
-    appendMessage("ai", data.reply || "🤖 I’m lost in the void. Try again?");
+    const reply = data.choices?.[0]?.message?.content || "No response";
+    res.json({ success: true, reply });
   } catch (err) {
     console.error(err);
-    appendMessage("ai", "❌ The AI is sleeping. Come back in a moment.");
+    res.status(500).json({ success: false, message: "AI request failed" });
   }
-}
+});
+
+// Validate Code
+app.post("/validate", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ success: false, message: "Code is required" });
+
+  try {
+    const resp = await fetch(GOOGLE_SHEETS_WEBHOOK);
+    const codesData = await resp.json();
+
+    if (!Array.isArray(codesData)) {
+      console.error("Google Sheets returned invalid data:", codesData);
+      return res.status(500).json({ success: false, message: "Invalid code database" });
+    }
+
+    const upperCode = code.toUpperCase();
+
+    if (!codesData.includes(upperCode)) {
+      return res.status(400).json({ success: false, message: "Invalid code." });
+    }
+
+    if (claimedCodes.has(upperCode)) {
+      return res.status(400).json({ success: false, message: "This code has already been claimed." });
+    }
+
+    res.json({ success: true, message: "Code is valid. Please submit your wallet to claim." });
+  } catch (err) {
+    console.error("Error checking Google Sheets:", err);
+    res.status(500).json({ success: false, message: "Error verifying code" });
+  }
+});
+
+// Claim Code
+app.post("/claim", async (req, res) => {
+  const { code, wallet } = req.body;
+  if (!code || !wallet) {
+    return res.status(400).json({ success: false, message: "Valid code and wallet are required" });
+  }
+
+  const upperCode = code.toUpperCase();
+
+  if (claimedCodes.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
+
+  claimedCodes.add(upperCode);
+
+  try {
+    await fetch(GOOGLE_SHEETS_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: upperCode, wallet })
+    });
+  } catch (err) {
+    console.error("Failed to send to Google Sheets:", err.message);
+  }
+
+  res.json({ success: true, message: "Whitelist claim successful" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Oddones backend running`));
