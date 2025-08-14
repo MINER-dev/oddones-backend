@@ -7,43 +7,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔹 Environment Variables (set in Render)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
+const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK; // Google Apps Script URL
 
-// 🔹 Load whitelist codes from file (still here if you want it for backup)
-const whitelist = new Set(
-  fs.readFileSync("whitelist_codes.txt", "utf8")
-    .split("\n")
-    .map(c => c.trim())
-    .filter(Boolean)
-);
+// Store claimed codes in memory (runtime only)
+let claimedCodes = new Set();
 
-// 🔹 Rate Limiting to prevent abuse
+// Rate limiting
 const requestCounts = new Map();
-const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 15;
 
 app.use((req, res, next) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
   const now = Date.now();
-
-  if (!requestCounts.has(ip)) {
-    requestCounts.set(ip, []);
-  }
-
+  if (!requestCounts.has(ip)) requestCounts.set(ip, []);
   const timestamps = requestCounts.get(ip).filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
   timestamps.push(now);
   requestCounts.set(ip, timestamps);
-
   if (timestamps.length > MAX_REQUESTS_PER_WINDOW) {
     return res.status(429).json({ success: false, message: "Too many requests. Please slow down!" });
   }
-
   next();
 });
 
-// 🟢 AI Chat Proxy
+// Chat endpoint
 app.post("/chat", async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ success: false, message: "No message provided" });
@@ -59,11 +47,7 @@ app.post("/chat", async (req, res) => {
       body: JSON.stringify({
         model: "mistralai/mistral-7b-instruct:free",
         messages: [
-          {
-            role: "system",
-            content: `You are the Oddones assistant. Only answer about Oddones and whitelist codes.
-                      If asked off-topic, reply sarcastically and redirect to Oddones. Keep responses short and witty.`
-          },
+          { role: "system", content: `You are the Oddones assistant. Only answer about Oddones and whitelist codes.` },
           { role: "user", content: message }
         ]
       })
@@ -71,7 +55,6 @@ app.post("/chat", async (req, res) => {
 
     const data = await resp.json();
     const reply = data.choices?.[0]?.message?.content || "No response";
-
     res.json({ success: true, reply });
   } catch (err) {
     console.error(err);
@@ -79,66 +62,64 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// 🟢 Step 1: Validate Code (Google Sheets)
+// Validate Code
 app.post("/validate", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ success: false, message: "Code is required" });
 
-  const upperCode = code.toUpperCase();
-
   try {
-    // Fetch all codes from Google Sheets
-    const sheetResp = await fetch(`${GOOGLE_SHEETS_WEBHOOK}?type=fetch`);
-    const codesData = await sheetResp.json(); // Expect [{code:"...", status:"UNUSED"}, ...]
+    const resp = await fetch(GOOGLE_SHEETS_WEBHOOK);
+    const codesData = await resp.json();
 
-    const foundCode = codesData.find(row => row.code === upperCode);
+    if (!Array.isArray(codesData)) {
+      console.error("Google Sheets returned invalid data:", codesData);
+      return res.status(500).json({ success: false, message: "Invalid code database" });
+    }
 
-    if (!foundCode) {
+    const upperCode = code.toUpperCase();
+
+    if (!codesData.includes(upperCode)) {
       return res.status(400).json({ success: false, message: "Invalid code." });
     }
 
-    if (foundCode.status === "USED") {
+    if (claimedCodes.has(upperCode)) {
       return res.status(400).json({ success: false, message: "This code has already been claimed." });
     }
 
     res.json({ success: true, message: "Code is valid. Please submit your wallet to claim." });
   } catch (err) {
     console.error("Error checking Google Sheets:", err);
-    res.status(500).json({ success: false, message: "Error verifying code." });
+    res.status(500).json({ success: false, message: "Error verifying code" });
   }
 });
 
-// 🟢 Step 2: Claim Code with Wallet (Google Sheets)
+// Claim Code
 app.post("/claim", async (req, res) => {
   const { code, wallet } = req.body;
-  if (!code || !wallet || wallet === "pending") {
+  if (!code || !wallet) {
     return res.status(400).json({ success: false, message: "Valid code and wallet are required" });
   }
 
   const upperCode = code.toUpperCase();
 
+  if (claimedCodes.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
+
+  claimedCodes.add(upperCode);
+
   try {
-    // Mark code as USED in Google Sheets
-    const updateResp = await fetch(GOOGLE_SHEETS_WEBHOOK, {
+    await fetch(GOOGLE_SHEETS_WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: upperCode, wallet, status: "USED" })
+      body: JSON.stringify({ code: upperCode, wallet })
     });
-
-    const updateData = await updateResp.json();
-
-    if (!updateData.success) {
-      return res.status(400).json({ success: false, message: updateData.message || "Failed to claim code." });
-    }
-
-    console.log("New claim:", { code: upperCode, wallet });
-    res.json({ success: true, message: "Whitelist claim successful" });
   } catch (err) {
-    console.error("Error updating Google Sheets:", err);
-    res.status(500).json({ success: false, message: "Error saving wallet." });
+    console.error("Failed to send to Google Sheets:", err.message);
   }
+
+  res.json({ success: true, message: "Whitelist claim successful" });
 });
 
-// Render Port Handling
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes`));
+app.listen(PORT, () => console.log(`✅ Oddones backend running`));
