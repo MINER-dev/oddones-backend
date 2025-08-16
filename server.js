@@ -156,10 +156,6 @@ app.post("/claim", async (req, res) => {
 // Render Port Handling
 const PORT = process.env.PORT || 3000;
 // 🟢 Debug: Check claimed codes
-app.get("/debug/claimed", (req, res) => {
-  res.json([...claimedCodes]);
-});
-
 app.listen(PORT, () =>
   console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes and ${claimedCodes.size} claimed codes`)
 );
