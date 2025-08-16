@@ -157,6 +157,12 @@ app.post("/claim", async (req, res) => {
     return res.status(400).json({ success: false, message: "Valid code and wallet are required" });
   }
 
+  // ✅ Wallet format check (must be 0x + 40 hex chars)
+  const isValidWallet = /^0x[a-fA-F0-9]{40}$/.test(wallet);
+  if (!isValidWallet) {
+    return res.status(400).json({ success: false, message: "❌ Invalid address. Please input a correct address." });
+  }
+
   const upperCode = code.toUpperCase();
 
   if (!whitelist.has(upperCode)) {
