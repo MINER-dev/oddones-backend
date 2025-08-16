@@ -2,16 +2,23 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import fetch from "node-fetch";
+import pkg from "@supabase/supabase-js";
+
+const { createClient } = pkg;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔹 Environment Variables (set in Render)
+// 🔹 Environment Variables (set in Render dashboard)
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// 🔹 Load whitelist codes from file
+// ✅ Initialize Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// 🔹 Load whitelist codes from file (still local whitelist_codes.txt)
 const whitelist = new Set(
   fs.readFileSync("whitelist_codes.txt", "utf8")
     .split("\n")
@@ -19,27 +26,9 @@ const whitelist = new Set(
     .filter(Boolean)
 );
 
-// 🔹 Load claimed codes from JSON file
-const CLAIMED_CODES_FILE = "claimed_codes.json";
-let claimedCodes = new Set();
-
-if (fs.existsSync(CLAIMED_CODES_FILE)) {
-  try {
-    const data = JSON.parse(fs.readFileSync(CLAIMED_CODES_FILE, "utf8"));
-    claimedCodes = new Set(data);
-  } catch (err) {
-    console.error("⚠️ Failed to load claimed codes file:", err.message);
-  }
-}
-
-// 🔹 Save claimed codes to file
-function saveClaimedCodes() {
-  fs.writeFileSync(CLAIMED_CODES_FILE, JSON.stringify([...claimedCodes], null, 2));
-}
-
 // 🔹 Rate Limiting
 const requestCounts = new Map();
-const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_REQUESTS_PER_WINDOW = 15;
 
 app.use((req, res, next) => {
@@ -98,7 +87,7 @@ app.post("/chat", async (req, res) => {
 });
 
 // 🟢 Step 1: Validate Code
-app.post("/validate", (req, res) => {
+app.post("/validate", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ success: false, message: "Code is required" });
 
@@ -108,14 +97,26 @@ app.post("/validate", (req, res) => {
     return res.status(400).json({ success: false, message: "Invalid code." });
   }
 
-  if (claimedCodes.has(upperCode)) {
+  // Check if already claimed in Supabase
+  const { data, error } = await supabase
+    .from("claims")
+    .select("id")
+    .eq("code", upperCode)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase error (validate):", error.message);
+    return res.status(500).json({ success: false, message: "Server error checking code" });
+  }
+
+  if (data) {
     return res.status(400).json({ success: false, message: "This code has already been claimed." });
   }
 
   res.json({ success: true, message: "Code is valid. Please submit your wallet to claim." });
 });
 
-// 🟢 Step 2: Claim Code with Wallet
+// 🟢 Step 2: Claim Code
 app.post("/claim", async (req, res) => {
   const { code, wallet } = req.body;
   if (!code || !wallet || wallet === "pending") {
@@ -128,34 +129,38 @@ app.post("/claim", async (req, res) => {
     return res.status(400).json({ success: false, message: "Invalid code." });
   }
 
-  if (claimedCodes.has(upperCode)) {
+  // Check again if already claimed
+  const { data, error } = await supabase
+    .from("claims")
+    .select("id")
+    .eq("code", upperCode)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase error (claim check):", error.message);
+    return res.status(500).json({ success: false, message: "Server error checking claim" });
+  }
+
+  if (data) {
     return res.status(400).json({ success: false, message: "This code has already been claimed." });
   }
 
-  // ✅ Claim now
-  claimedCodes.add(upperCode);
-  saveClaimedCodes();
+  // ✅ Insert into Supabase
+  const { error: insertError } = await supabase
+    .from("claims")
+    .insert([{ code: upperCode, wallet }]);
 
-  // ✅ Forward to Google Sheets (but don’t fail if Sheets is down)
-  try {
-    if (GOOGLE_SHEETS_WEBHOOK) {
-      await fetch(GOOGLE_SHEETS_WEBHOOK, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: upperCode, wallet, timestamp: new Date().toISOString() })
-      });
-    }
-  } catch (err) {
-    console.error("⚠️ Failed to send to Google Sheets:", err.message);
+  if (insertError) {
+    console.error("Supabase error (insert):", insertError.message);
+    return res.status(500).json({ success: false, message: "Failed to store claim" });
   }
 
-  console.log("✅ New claim:", { code: upperCode, wallet });
+  console.log("New claim stored in Supabase:", { code: upperCode, wallet });
   res.json({ success: true, message: "Whitelist claim successful" });
 });
 
 // Render Port Handling
 const PORT = process.env.PORT || 3000;
-// 🟢 Debug: Check claimed codes
 app.listen(PORT, () =>
-  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes and ${claimedCodes.size} claimed codes`)
+  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes (Supabase enabled)`)
 );
