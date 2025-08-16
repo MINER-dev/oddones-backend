@@ -1,163 +1,219 @@
-const BACKEND_URL = "https://oddones-backend.onrender.com"; // replace with your actual Render URL
+import express from "express";
+import cors from "cors";
+import fs from "fs";
+import fetch from "node-fetch";
+import pkg from "@supabase/supabase-js";
 
-const messagesContainer = document.getElementById("messages");
-const chatForm = document.getElementById("chat-form");
-const input = document.getElementById("message-input");
+const { createClient } = pkg;
 
-let awaitingWallet = false;
-let lastValidCode = null;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// Welcome message
-typeMessage("ai", "👾 Yo misfit, welcome to Oddones. Got a code, or wanna talk chaos?");
+// 🔹 Environment Variables (set in Render dashboard)
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
 
-// 🟢 Append static messages
-function appendMessage(sender, text) {
-  const div = document.createElement("div");
-  div.className = `msg ${sender}`;
-  div.textContent = text;
-  messagesContainer.appendChild(div);
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
-}
+// ✅ Initialize Supabase client
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// 🟢 Typing effect for messages
-function typeMessage(sender, text, speed = 25) {
-  const div = document.createElement("div");
-  div.className = `msg ${sender}`;
-  messagesContainer.appendChild(div);
+// 🔹 Load whitelist codes from file
+const whitelist = new Set(
+  fs.readFileSync("whitelist_codes.txt", "utf8")
+    .split("\n")
+    .map(c => c.trim())
+    .filter(Boolean)
+);
 
-  let i = 0;
-  function typeChar() {
-    if (i < text.length) {
-      div.textContent += text.charAt(i);
-      i++;
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
-      setTimeout(typeChar, speed);
-    }
-  }
-  typeChar();
-}
+// 🔹 Rate Limiting
+const requestCounts = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 15;
 
-// 🟢 Check for whitelist code format
-function isWhitelistCode(message) {
-  return /^ODD-[A-Z0-9]{4}-[A-Z0-9]{4}$/i.test(message.trim());
-}
+app.use((req, res, next) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const now = Date.now();
 
-// 🟢 Check for valid Hyperliquid wallet (0x + 40 hex chars)
-function isValidWallet(wallet) {
-  return /^0x[a-fA-F0-9]{40}$/.test(wallet.trim());
-}
-
-// 🟢 Handle chat input
-chatForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const userMessage = input.value.trim();
-  if (!userMessage) return;
-
-  appendMessage("user", userMessage);
-  input.value = "";
-
-  if (awaitingWallet) {
-    handleWalletSubmission(userMessage);
-    return;
+  if (!requestCounts.has(ip)) {
+    requestCounts.set(ip, []);
   }
 
-  if (isWhitelistCode(userMessage)) {
-    handleWhitelistCode(userMessage.toUpperCase());
-    return;
+  const timestamps = requestCounts.get(ip).filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
+  timestamps.push(now);
+  requestCounts.set(ip, timestamps);
+
+  if (timestamps.length > MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({ success: false, message: "Too many requests. Please slow down!" });
   }
 
-  await sendToAI(userMessage);
+  next();
 });
 
-// 🟢 Step 1: Validate Code
-async function handleWhitelistCode(code) {
-  typeMessage("ai", "🔍 Checking your code...");
+// 🟢 AI Chat Proxy
+app.post("/chat", async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ success: false, message: "No message provided" });
 
   try {
-    const res = await fetch(`${BACKEND_URL}/validate`, {
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code })
-    });
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://yourdomain.com"
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct:free",
+        messages: [
+          {
+            role: "system",
+            content: `
+You are OddBot, the Oddones AI assistant.
 
-    const data = await res.json();
+📌 Behavior Rules:
+- If the user asks about **Oddones**, use this context:
+  Overview:
+  Oddones_HL is a 444-supply NFT project built on Hyperliquid. It's made for chaos-loving traders, onchain misfits, and liquidity-obsessed investors. Holders gain real trading utilities, passive yield, and exclusive alpha access.
 
-    if (data.success) {
-      typeMessage("ai", "🎉 Code’s legit. Now drop your wallet, champ.");
-      awaitingWallet = true;
-      lastValidCode = code;
-    } else {
-      typeMessage("ai", `❌ Nope. ${data.message}`);
-    }
-  } catch (err) {
-    console.error(err);
-    typeMessage("ai", "❌ Server’s having a meltdown. Try later.");
-  }
-}
+  Core Details:
+  Chain: Hyperliquid | Supply: 444 NFTs | Mint Price: TBA
+  Theme: Odd minds, elite tools, unorthodox dominance.
 
-// 🟢 Step 2: Submit Wallet to Claim
-async function handleWalletSubmission(wallet) {
-  if (!isValidWallet(wallet)) {
-    typeMessage("ai", "❌ Nah, that ain’t a real Hyperliquid wallet (needs 0x + 40 hex). Try again.");
-    return;
-  }
+  Utilities:
+  1. Hyperliquid Vaults → 10% royalties + 5% mint funds into a trading vault, quarterly profit airdrops.
+  2. Whale Watcher Bot → Alpha bot scanning Hyperliquid for whale trades, liquidation zones, alerts on Discord/Telegram.
+  3. Odd Terminal → NFT-gated dashboard: track leaderboard traders, wallet mirroring, trading stats.
+  4. Copytrade Pool → Stake NFT to auto-copy top traders. DAO-voted managers. Loss insurance.
+  5. Rugproof Smart Refunds → If utilities not delivered in 60 days, 25% of mint auto-refunded.
 
-  typeMessage("ai", "💾 Plugging your wallet into the chaos...");
+  Elite Holder Perks:
+  - Top 44 wallets get 1/1 Rare Oddones with boosted utilities.
+  - HL token airdrops.
+  - WL access for future projects.
 
-  try {
-    const res = await fetch(`${BACKEND_URL}/claim`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: lastValidCode, wallet })
-    });
+  Lore:
+  "We’re not kings. We’re not traders. We are the Odd Ones. We liquidate legends and rewrite charts."
+  Only 444 exist. If you’re not Odd, you’re irrelevant.
 
-    const data = await res.json();
+- If the user asks about **codes / whitelist**, reply:
+  "If you already have a code, enter it to validate. If you don’t, you’ll need to request one directly from the Oddones team."
 
-    if (data.success) {
-      typeMessage("ai", "✅ Locked in. You’re officially Odd now.");
-      awaitingWallet = false;
-      lastValidCode = null;
-    } else {
-      typeMessage("ai", `❌ ${data.message}`);
-    }
-  } catch (err) {
-    console.error(err);
-    typeMessage("ai", "❌ Glitch in the matrix. Try again later.");
-  }
-}
+- If the question is off-topic, reply sarcastically but redirect them back to Oddones.
 
-// 🟢 AI Chat
-async function sendToAI(userMessage) {
-  const typingIndicator = document.createElement("div");
-  typingIndicator.className = "msg ai";
-  typingIndicator.textContent = "OddBot AI is typing...";
-  messagesContainer.appendChild(typingIndicator);
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-  try {
-    const resp = await fetch(`${BACKEND_URL}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMessage })
+- Keep responses short, witty, and a little chaotic.
+`
+          },
+          { role: "user", content: message }
+        ]
+      })
     });
 
     const data = await resp.json();
-    typingIndicator.remove();
+    const reply = data.choices?.[0]?.message?.content || "No response";
 
-    if (!data.success) {
-      typeMessage("ai", "❌ Bot glitched. Ping me later.");
-      return;
-    }
+    res.json({ success: true, reply });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "AI request failed" });
+  }
+});
 
-    const reply = data.reply || "🤖 Static noise... ask again?";
-    if (/bitcoin|politics|sports/i.test(userMessage)) {
-      typeMessage("ai", "😂 Wrong channel, legend. We only talk Oddones here.");
-    } else {
-      typeMessage("ai", reply);
+// 🟢 Step 1: Validate Code
+app.post("/validate", async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ success: false, message: "Code is required" });
+
+  const upperCode = code.toUpperCase();
+
+  if (!whitelist.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "Invalid code." });
+  }
+
+  // Check if already claimed in Supabase
+  const { data, error } = await supabase
+    .from("claims")
+    .select("id")
+    .eq("code", upperCode)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase error (validate):", error.message);
+    return res.status(500).json({ success: false, message: "Server error checking code" });
+  }
+
+  if (data) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
+
+  res.json({ success: true, message: "Code is valid. Please submit your wallet to claim." });
+});
+
+// 🟢 Step 2: Claim Code
+app.post("/claim", async (req, res) => {
+  const { code, wallet } = req.body;
+  if (!code || !wallet || wallet === "pending") {
+    return res.status(400).json({ success: false, message: "Valid code and wallet are required" });
+  }
+
+  // ✅ Wallet format check (must be 0x + 40 hex chars)
+  const isValidWallet = /^0x[a-fA-F0-9]{40}$/.test(wallet);
+  if (!isValidWallet) {
+    return res.status(400).json({ success: false, message: "❌ Invalid address. Please input a correct address." });
+  }
+
+  const upperCode = code.toUpperCase();
+
+  if (!whitelist.has(upperCode)) {
+    return res.status(400).json({ success: false, message: "Invalid code." });
+  }
+
+  // Check again if already claimed
+  const { data, error } = await supabase
+    .from("claims")
+    .select("id")
+    .eq("code", upperCode)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase error (claim check):", error.message);
+    return res.status(500).json({ success: false, message: "Server error checking claim" });
+  }
+
+  if (data) {
+    return res.status(400).json({ success: false, message: "This code has already been claimed." });
+  }
+
+  // ✅ Insert into Supabase
+  const { error: insertError } = await supabase
+    .from("claims")
+    .insert([{ code: upperCode, wallet }]);
+
+  if (insertError) {
+    console.error("Supabase error (insert):", insertError.message);
+    return res.status(500).json({ success: false, message: "Failed to store claim" });
+  }
+
+  // ✅ Also forward to Google Sheets webhook
+  try {
+    if (GOOGLE_SHEETS_WEBHOOK) {
+      await fetch(GOOGLE_SHEETS_WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: upperCode, wallet })
+      });
     }
   } catch (err) {
-    typingIndicator.remove();
-    console.error(err);
-    typeMessage("ai", "❌ Bot’s out cold. Try again later.");
+    console.error("Failed to send to Google Sheets:", err.message);
   }
-}
+
+  console.log("New claim stored in Supabase + Google Sheets:", { code: upperCode, wallet });
+  res.json({ success: true, message: "Whitelist claim successful" });
+});
+
+// Render Port Handling
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes (Supabase + Google Sheets enabled)`)
+);
