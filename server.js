@@ -19,10 +19,25 @@ const whitelist = new Set(
     .filter(Boolean)
 );
 
-// 🔹 Track claimed codes
+// 🔹 Load claimed codes from JSON file
+const CLAIMED_CODES_FILE = "claimed_codes.json";
 let claimedCodes = new Set();
 
-// 🔹 Rate Limiting to prevent abuse
+if (fs.existsSync(CLAIMED_CODES_FILE)) {
+  try {
+    const data = JSON.parse(fs.readFileSync(CLAIMED_CODES_FILE, "utf8"));
+    claimedCodes = new Set(data);
+  } catch (err) {
+    console.error("⚠️ Failed to load claimed codes file:", err.message);
+  }
+}
+
+// 🔹 Save claimed codes to file
+function saveClaimedCodes() {
+  fs.writeFileSync(CLAIMED_CODES_FILE, JSON.stringify([...claimedCodes], null, 2));
+}
+
+// 🔹 Rate Limiting
 const requestCounts = new Map();
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 15;
@@ -119,22 +134,27 @@ app.post("/claim", async (req, res) => {
 
   // ✅ Claim now
   claimedCodes.add(upperCode);
+  saveClaimedCodes();
 
-  // Forward to Google Sheets webhook
+  // ✅ Forward to Google Sheets (but don’t fail if Sheets is down)
   try {
-    await fetch(GOOGLE_SHEETS_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: upperCode, wallet })
-    });
+    if (GOOGLE_SHEETS_WEBHOOK) {
+      await fetch(GOOGLE_SHEETS_WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: upperCode, wallet, timestamp: new Date().toISOString() })
+      });
+    }
   } catch (err) {
-    console.error("Failed to send to Google Sheets:", err.message);
+    console.error("⚠️ Failed to send to Google Sheets:", err.message);
   }
 
-  console.log("New claim:", { code: upperCode, wallet });
+  console.log("✅ New claim:", { code: upperCode, wallet });
   res.json({ success: true, message: "Whitelist claim successful" });
 });
 
 // Render Port Handling
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes`));
+app.listen(PORT, () =>
+  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes and ${claimedCodes.size} claimed codes`)
+);
