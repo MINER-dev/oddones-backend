@@ -14,6 +14,7 @@ app.use(express.json());
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GOOGLE_SHEETS_WEBHOOK = process.env.GOOGLE_SHEETS_WEBHOOK;
 
 // ✅ Initialize Supabase client
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -155,12 +156,25 @@ app.post("/claim", async (req, res) => {
     return res.status(500).json({ success: false, message: "Failed to store claim" });
   }
 
-  console.log("New claim stored in Supabase:", { code: upperCode, wallet });
+  // ✅ Also forward to Google Sheets webhook
+  try {
+    if (GOOGLE_SHEETS_WEBHOOK) {
+      await fetch(GOOGLE_SHEETS_WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: upperCode, wallet })
+      });
+    }
+  } catch (err) {
+    console.error("Failed to send to Google Sheets:", err.message);
+  }
+
+  console.log("New claim stored in Supabase + Google Sheets:", { code: upperCode, wallet });
   res.json({ success: true, message: "Whitelist claim successful" });
 });
 
 // Render Port Handling
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes (Supabase enabled)`)
+  console.log(`✅ Oddones backend running with ${whitelist.size} whitelist codes (Supabase + Google Sheets enabled)`)
 );
